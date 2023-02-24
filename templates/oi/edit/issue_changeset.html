@@ -232,6 +232,12 @@
         {% csrf_token %}
         <input type="submit" value="Migrate Credits" style="color: red">
       </form>
+        {% elif story.feature %}
+      <form class="story_button" method="POST" style="color: red"
+            action="{% url "migrate_story_revision" id=story.id %}">
+        {% csrf_token %}
+        <input type="submit" value="Migrate Feature" style="color: red">
+      </form>
         {% endif %}
       {% else %}
         {% if issuerevision.variant_cover_status == 3 %}
