@@ -9,7 +9,8 @@ from calendar import monthrange
 from operator import attrgetter
 from random import randint
 
-from django.db.models import F, Q, Min, Count, Sum, Case, When, Value
+from django.db.models import F, Q, Min, Count, Sum, Case, When, Value, \
+                             OuterRef, Subquery
 from django.conf import settings
 import django.urls as urlresolvers
 from django.shortcuts import get_object_or_404, \
@@ -27,6 +28,7 @@ from django_tables2.export.export import TableExport
 from djqscsv import render_to_csv_response
 
 from apps.indexer.views import ViewTerminationError
+from apps.indexer.models import Indexer
 
 from apps.stddata.models import Country, Language
 from apps.stats.models import CountStats
@@ -43,7 +45,7 @@ from apps.gcd.models import Publisher, Series, Issue, StoryType, Image,\
                             CharacterRelation, GroupRelation, GroupMembership
 from apps.gcd.models.creator import FeatureCreatorTable, SeriesCreatorTable,\
                                     CharacterCreatorTable, GroupCreatorTable,\
-                                    NAME_TYPES
+                                    CreatorCreatorTable, NAME_TYPES
 from apps.gcd.models.character import CharacterTable
 from apps.gcd.models.feature import FeatureTable
 from apps.gcd.models.issue import IssueTable, BrandGroupIssueTable,\
@@ -59,6 +61,8 @@ from apps.gcd.views.covers import get_image_tag, get_generic_image_tag, \
                                   get_image_tags_per_issue, \
                                   get_image_tags_per_page
 from apps.gcd.models.cover import CoverIssuePublisherTable, \
+                                  CoverIssueStoryTable, \
+                                  CoverIssueStoryPublisherTable, \
                                   ZOOM_SMALL, ZOOM_MEDIUM, ZOOM_LARGE
 from apps.gcd.forms import get_generic_select_form
 from apps.oi import states
@@ -66,6 +70,7 @@ from apps.oi.models import IssueRevision, SeriesRevision, PublisherRevision, \
                            BrandGroupRevision, BrandRevision, CoverRevision, \
                            IndiciaPublisherRevision, ImageRevision, Changeset,\
                            SeriesBondRevision, CreatorRevision, CTYPES
+from apps.select.views import SeriesFilter, filter_issues, filter_sequences
 
 KEY_DATE_REGEXP = \
   re.compile(r'^(?P<year>\d{4})\-(?P<month>\d{2})\-(?P<day>\d{2})$')
@@ -81,6 +86,7 @@ IS_NONE = '[IS_NONE]'
 
 ISSUE_CHECKLIST_DISCLAIMER = 'In the checklist results for stories, covers, '\
                              'and cartoons are shown.'
+OVERVIEW_DISCLAIMER = 'In the overview only comic stories are shown.'
 COVER_CHECKLIST_DISCLAIMER = 'In the checklist results for covers are shown.'
 MIGRATE_DISCLAIMER = ' Text credits are currently being migrated to '\
                      'links. Therefore not all credits in our '\
@@ -127,17 +133,16 @@ def get_gcd_object(model, object_id, model_name=None):
     return object
 
 
-def generic_sortable_list(request, items, table, template, context):
-    paginator = ResponsePaginator(items, per_page=100, vars=context)
+def generic_sortable_list(request, items, table, template, context,
+                          per_page=100):
+    paginator = ResponsePaginator(items, per_page=per_page, vars=context)
     page_number = paginator.paginate(request).number
-
-    if 'sort' in request.GET:
-        extra_string = 'sort=%s' % (request.GET['sort'])
-    else:
-        extra_string = ''
+    request_get = request.GET.copy()
+    request_get.pop('page', None)
+    extra_string = request_get.urlencode()
 
     RequestConfig(request, paginate={"paginator_class": LazyPaginator,
-                                     'per_page': 100,
+                                     'per_page': per_page,
                                      'page': page_number}).configure(table)
     export_format = request.GET.get("_export", None)
     if TableExport.is_valid_format(export_format):
@@ -148,7 +153,8 @@ def generic_sortable_list(request, items, table, template, context):
                   if f.auto_created is False]
         fields = [f for f in fields if f not in {'created', 'modified',
                                                  'deleted', 'keywords',
-                                                 'tagged_items'}]
+                                                 'tagged_items', 'awards',
+                                                 'portrait', 'sample_scan'}]
         fields.insert(0, 'id')
         if export_format == 'db_csv':
             return render_to_csv_response(items.values(*fields),
@@ -171,6 +177,10 @@ def _handle_date_picker(request, url_reverse,
         if 'year' in request.GET:
             year = int(request.GET['year'])
             month = int(request.GET['month'])
+            if 'sort' in request.GET:
+                sort = '?sort=' + request.GET['sort']
+            else:
+                sort = ''
             if daily:
                 day = int(request.GET['day'])
                 # Do a redirect, otherwise pagination links point to today
@@ -186,7 +196,7 @@ def _handle_date_picker(request, url_reverse,
                 return HttpResponseRedirect(
                     urlresolvers.reverse(
                         url_reverse,
-                        kwargs=kwargs)), False
+                        kwargs=kwargs) + sort), False
         elif show_date:
             year = int(show_date[0:4])
             month = int(show_date[5:7])
@@ -253,7 +263,7 @@ def creator_sequences(request, creator_id, series_id=None,
         creator_names = creator.creator_names.filter(deleted=False)
     else:
         creator = get_gcd_object(Creator, creator_id)
-        creator_names = list(_get_creator_names_for_checklist(creator))
+        creator_names = _get_creator_names_for_checklist(creator)
 
     stories = Story.objects.filter(credits__creator__in=creator_names,
                                    credits__deleted=False).distinct()\
@@ -280,11 +290,18 @@ def creator_sequences(request, creator_id, series_id=None,
     else:
         heading = 'Sequences for Creator %s' % (creator)
 
+    if not series_id:
+        filter = filter_sequences(request, stories)
+        stories = filter.qs
+    else:
+        filter = None
+
     context = {
         'result_disclaimer': MIGRATE_DISCLAIMER,
         'item_name': 'sequence',
         'plural_suffix': 's',
-        'heading': heading
+        'heading': heading,
+        'filter': filter
     }
     template = 'gcd/search/issue_list_sortable.html'
     table = StoryTable(stories, attrs={'class': 'sortable_listing'},
@@ -295,7 +312,7 @@ def creator_sequences(request, creator_id, series_id=None,
 
 def creator_characters(request, creator_id, country=None):
     creator = get_gcd_object(Creator, creator_id)
-    names = list(_get_creator_names_for_checklist(creator))
+    names = _get_creator_names_for_checklist(creator)
 
     characters = Character.objects.filter(
       character_names__storycharacter__story__credits__creator__in=names,
@@ -344,13 +361,80 @@ def creator_characters(request, creator_id, country=None):
     table = CharacterTable(characters, attrs={'class': 'sortable_listing'},
                            creator=creator,
                            template_name='gcd/bits/sortable_table.html',
-                           order_by=('feature'))
+                           order_by=('character'))
     return generic_sortable_list(request, characters, table, template, context)
 
 
-def creator_features(request, creator_id, country=None, language=None):
+def creator_creators(request, creator_id):
+    # list of creators the creator creator_id worked with
     creator = get_gcd_object(Creator, creator_id)
-    names = list(_get_creator_names_for_checklist(creator))
+    names = _get_creator_names_for_checklist(creator)
+
+    stories = Story.objects.filter(credits__creator__in=names,
+                                   credits__credit_type__id__lt=6,
+                                   credits__deleted=False).distinct()
+    filter = filter_sequences(request, stories)
+    stories = filter.qs
+    stories_ids = stories.values_list('id', flat=True)
+
+    creators = Creator.objects.filter(
+      creator_names__storycredit__story__id__in=stories_ids,
+      creator_names__storycredit__story__type__id__in=CORE_TYPES,
+      creator_names__storycredit__deleted=False,
+      creator_names__storycredit__credit_type__id__lt=6).exclude(id=creator.id)
+    creators = creators.annotate(
+      issue_credits_count=Count("creator_names__storycredit__story__issue",
+                                distinct=True))
+    creators = creators.annotate(first_credit=Min(
+      Case(When(creator_names__storycredit__story__issue__key_date="",
+                then=Value("9999-99-99"),
+                ),
+           default=F("creator_names__storycredit__story__issue__key_date"),
+           )))
+
+    target = 'creator_names__storycredit__credit_type__id'
+    script = Count('creator_names__storycredit__story__issue',
+                   filter=Q(**{target: 1}),
+                   distinct=True)
+    pencils = Count('creator_names__storycredit__story__issue',
+                    filter=Q(**{target: 2}),
+                    distinct=True)
+    inks = Count('creator_names__storycredit__story__issue',
+                 filter=Q(**{target: 3}),
+                 distinct=True)
+    colors = Count('creator_names__storycredit__story__issue',
+                   filter=Q(**{target: 4}),
+                   distinct=True)
+    letters = Count('creator_names__storycredit__story__issue',
+                    filter=Q(**{target: 5}),
+                    distinct=True)
+
+    creators = creators.annotate(
+      script=script,
+      pencils=pencils,
+      inks=inks,
+      colors=colors,
+      letters=letters)
+
+    context = {
+        'result_disclaimer': ISSUE_CHECKLIST_DISCLAIMER + MIGRATE_DISCLAIMER,
+        'item_name': 'creator',
+        'plural_suffix': 's',
+        'heading': 'Creators that worked with Creator %s' % (creator),
+        'filter': filter
+    }
+    template = 'gcd/search/issue_list_sortable.html'
+    table = CreatorCreatorTable(creators, attrs={'class': 'sortable_listing'},
+                                creator=creator,
+                                template_name='gcd/bits/sortable_table.html',
+                                order_by=('name'))
+    return generic_sortable_list(request, creators, table, template, context)
+
+
+def creator_features(request, creator_id, country=None, language=None):
+    # list of features the creator creator_id worked on
+    creator = get_gcd_object(Creator, creator_id)
+    names = _get_creator_names_for_checklist(creator)
 
     features = Feature.objects.filter(story__credits__creator__in=names,
                                       story__credits__deleted=False).distinct()
@@ -392,7 +476,7 @@ def creator_features(request, creator_id, country=None, language=None):
         'result_disclaimer': MIGRATE_DISCLAIMER,
         'item_name': 'feature',
         'plural_suffix': 's',
-        'heading': 'Features for Creator %s' % (creator)
+        'heading': 'Features for Creator %s' % (creator),
     }
     template = 'gcd/search/issue_list_sortable.html'
     table = FeatureTable(features, attrs={'class': 'sortable_listing'},
@@ -400,6 +484,40 @@ def creator_features(request, creator_id, country=None, language=None):
                          template_name='gcd/bits/sortable_table.html',
                          order_by=('feature'))
     return generic_sortable_list(request, features, table, template, context)
+
+
+def creator_overview(request, creator_id):
+    creator = get_gcd_object(Creator, creator_id)
+    creator_names = _get_creator_names_for_checklist(creator)
+    filter = None
+
+    issues = Issue.objects.filter(story__credits__creator__in=creator_names,
+                                  story__type__id=19,
+                                  story__credits__deleted=False,
+                                  story__credits__credit_type__id__lt=6)\
+                  .distinct().select_related('series__publisher')
+    issues = issues.annotate(
+        longest_story_id=Subquery(Story.objects.filter(
+                                  credits__creator__in=creator_names,
+                                  issue_id=OuterRef('pk'),
+                                  type_id=19, deleted=False)
+                                  .values('pk')
+                                  .order_by('-page_count')[:1]))
+    filter = filter_issues(request, issues)
+    issues = filter.qs
+
+    context = {
+        'item_name': 'issue',
+        'plural_suffix': 's',
+        'publisher': True,
+        'filter': filter,
+        'heading': 'Issue Overview for Creator %s' % (creator)
+    }
+    template = 'gcd/search/issue_list_sortable.html'
+    table = CoverIssueStoryTable(issues, attrs={'class': 'sortable_listing'},
+                                 template_name='gcd/bits/sortable_table.html',
+                                 order_by=('publication_date'))
+    return generic_sortable_list(request, issues, table, template, context, 50)
 
 
 def creator_issues(request, creator_id, series_id,
@@ -416,12 +534,21 @@ def creator_edited_issues(request, creator_id, series_id=None,
 
 def _get_creator_names_for_checklist(creator):
     creator_names = creator.creator_names.filter(deleted=False)
-    if creator.official_creator_detail.type_id == NAME_TYPES['house']:
+    if creator.official_creator_detail.type_id in [NAME_TYPES['house'],
+                                                   NAME_TYPES['joint']]:
         house_names = creator.from_related_creator.filter(
             relation_type_id=4, creator_name__isnull=False)\
             .values_list('creator_name', flat=True)
         creator_names |= CreatorNameDetail.objects.filter(id__in=house_names)
-    creator_names = creator_names.values_list('id', flat=True)
+    creator_names = list(creator_names.values_list('id', flat=True))
+    if creator.official_creator_detail.type_id == NAME_TYPES['studio']:
+        employees = []
+        for rel in creator.active_relations()\
+                          .filter(relation_type_id__in=[2, 3]):
+            if rel.creator_name.all():
+                for name in rel.creator_name.all():
+                    employees.append(name.id)
+        creator_names.extend(employees)
     return creator_names
 
 
@@ -432,7 +559,7 @@ def creator_series(request, creator_id, country=None, language=None):
                           {'error_text':
                            'There is no raw export for these objects.'})
     creator = get_gcd_object(Creator, creator_id)
-    names = list(_get_creator_names_for_checklist(creator))
+    names = _get_creator_names_for_checklist(creator)
 
     series = Series.objects.filter(
       issue__story__credits__creator__in=names,
@@ -463,6 +590,20 @@ def creator_series(request, creator_id, country=None, language=None):
     letters = Count('issue',
                     filter=Q(issue__story__credits__credit_type__id=5),
                     distinct=True)
+    data = set(series.values_list('country', 'language', 'publisher'))
+    countries = []
+    languages = []
+    publishers = []
+    for i in data:
+        countries.append(i[0])
+        languages.append(i[1])
+        publishers.append(i[2])
+    filter = SeriesFilter(request.GET,
+                          queryset=series,
+                          countries=countries,
+                          languages=languages,
+                          publishers=publishers)
+    series = filter.qs
     series = series.annotate(
       script=script,
       pencils=pencils,
@@ -474,7 +615,8 @@ def creator_series(request, creator_id, country=None, language=None):
         'result_disclaimer': ISSUE_CHECKLIST_DISCLAIMER + MIGRATE_DISCLAIMER,
         'item_name': 'series',
         'plural_suffix': '',
-        'heading': 'Series for Creator %s' % (creator)
+        'heading': 'Series for Creator %s' % (creator),
+        'filter': filter
     }
     template = 'gcd/search/issue_list_sortable.html'
     table = CreatorSeriesTable(series, attrs={'class': 'sortable_listing'},
@@ -485,24 +627,27 @@ def creator_series(request, creator_id, country=None, language=None):
 
 
 def checklist_by_id(request, creator_id, series_id=None, character_id=None,
-                    feature_id=None, edits=False, country=None, language=None):
+                    feature_id=None, co_creator_id=None, edits=False,
+                    country=None, language=None):
     """
     Provides checklists for a Creator. These include results for all
     CreatorNames and for the overall House Name all uses of that House Name.
     """
     creator = get_gcd_object(Creator, creator_id)
-    creator_names = list(_get_creator_names_for_checklist(creator))
+    creator_names = _get_creator_names_for_checklist(creator)
+    filter = None
 
     if edits:
         issues = Issue.objects.filter(credits__creator__in=creator_names,
                                       credits__deleted=False)\
                               .distinct().select_related('series__publisher')
     else:
-        issues = Issue.objects.filter(story__credits__creator__in=creator_names,
-                                      story__type__id__in=CORE_TYPES,
-                                      story__credits__deleted=False,
-                                      story__credits__credit_type__id__lt=6)\
-                              .distinct().select_related('series__publisher')
+        issues = Issue.objects.filter(
+          story__credits__creator__in=creator_names,
+          story__type__id__in=CORE_TYPES,
+          story__credits__deleted=False,
+          story__credits__credit_type__id__lt=6)\
+          .distinct().select_related('series__publisher')
     if country:
         country = get_object_or_404(Country, code=country)
         issues = issues.filter(series__country=country)
@@ -529,14 +674,36 @@ def checklist_by_id(request, creator_id, series_id=None, character_id=None,
                                                            feature)
     elif edits:
         heading = 'Issue Edit List for Creator %s' % (creator)
+        filter = filter_issues(request, issues)
+        issues = filter.qs
+    elif co_creator_id:
+        co_creator = get_gcd_object(Creator, co_creator_id)
+        stories = Story.objects.filter(credits__creator__creator=creator,
+                                       credits__deleted=False,
+                                       credits__credit_type__id__lt=6)\
+                               .filter(credits__creator__creator=co_creator,
+                                       credits__credit_type__id__lt=6,
+                                       credits__deleted=False)\
+                               .filter(type__id__in=CORE_TYPES,
+                                       deleted=False)
+        issue_list = stories.values_list('issue', flat=True)
+        issues = Issue.objects.filter(id__in=issue_list,
+                                      deleted=False).distinct()
+        filter = filter_issues(request, issues)
+        issues = filter.qs
+        heading = 'Issues for Creator %s with Creator %s' % (creator,
+                                                             co_creator)
     else:
         heading = 'Issue Checklist for Creator %s' % (creator)
+        filter = filter_issues(request, issues)
+        issues = filter.qs
 
     context = {
         'result_disclaimer': ISSUE_CHECKLIST_DISCLAIMER + MIGRATE_DISCLAIMER,
         'item_name': 'issue',
         'plural_suffix': 's',
-        'heading': heading
+        'heading': heading,
+        'filter': filter
     }
     if edits:
         context['result_disclaimer'] = MIGRATE_DISCLAIMER
@@ -550,7 +717,7 @@ def checklist_by_id(request, creator_id, series_id=None, character_id=None,
 def cover_checklist_by_id(request, creator_id, series_id=None,
                           country=None, language=None):
     creator = get_gcd_object(Creator, creator_id)
-    creator_names = list(_get_creator_names_for_checklist(creator))
+    creator_names = _get_creator_names_for_checklist(creator)
     issues = Issue.objects.filter(story__credits__creator__in=creator_names,
                                   story__type__id=6,
                                   story__credits__deleted=False,
@@ -569,12 +736,15 @@ def cover_checklist_by_id(request, creator_id, series_id=None,
                                                            series)
     else:
         heading = 'Cover Checklist for Creator %s' % (creator)
+        filter = filter_issues(request, issues)
+        issues = filter.qs
 
     context = {
         'result_disclaimer': COVER_CHECKLIST_DISCLAIMER + MIGRATE_DISCLAIMER,
         'item_name': 'cover',
         'plural_suffix': 's',
-        'heading': heading
+        'heading': heading,
+        'filter': filter,
     }
     template = 'gcd/search/issue_list_sortable.html'
     table = CoverIssuePublisherTable(
@@ -617,8 +787,9 @@ def checklist_by_name(request, creator, country=None, language=None,
                                      'series__publisher__name'))
     creator = Creator.objects.filter(gcd_official_name__iexact=creator)
     if creator and not to_be_migrated:
-        q_objs_credits = Q(**{'%scredits__creator__creator__in' % (prefix): creator,
-                              '%stype__id__in' % (prefix): CORE_TYPES})
+        q_objs_credits = Q(**{
+          '%scredits__creator__creator__in' % (prefix): creator,
+          '%stype__id__in' % (prefix): CORE_TYPES})
         items2 = Issue.objects.filter(q_objs_credits).distinct()\
                               .annotate(series_name=F('series__sort_name'))
         if 'sort' in request.GET:
@@ -641,12 +812,20 @@ def checklist_by_name(request, creator, country=None, language=None,
             items2 = items2.filter(series__language=language)
     if creator and not to_be_migrated:
         issues = issues.union(items2)
+        filter = None
+    else:
+        filter = filter_issues(request, issues)
+        issues = filter.qs
+
     template = 'gcd/search/issue_list_sortable.html'
     table = IssuePublisherTable(issues, attrs={'class': 'sortable_listing'},
                                 template_name='gcd/bits/sortable_table.html',
                                 order_by=('publication_date'))
     if not to_be_migrated:
         context['result_disclaimer'] = ISSUE_CHECKLIST_DISCLAIMER
+    else:
+        context['filter'] = filter
+
     return generic_sortable_list(request, issues, table, template, context)
 
 
@@ -939,20 +1118,67 @@ def show_publisher_current_series(request, publisher_id):
                                  'gcd/bits/generic_list.html', context)
 
 
+def _filter_issues_year_month(objects, year, month,
+                              use_on_sale=False, cover=False, yearly=False):
+    day = 99
+    if yearly:
+        month = 1
+    if month == 1:
+        # to get issues with month not set, start from end of year before
+        year_start = year-1
+        month_start = 14
+    else:
+        # start from month before
+        year_start = year
+        month_start = month-1
+
+    # key_date can have valid entry of 13, catch these for December
+    if month == 12 or yearly:
+        month_end = 14
+    else:
+        month_end = month
+
+    if use_on_sale:
+        date_field = 'on_sale_date'
+    else:
+        date_field = 'key_date'
+
+    if cover:
+        date_field = 'issue__' + date_field
+        order_series = 'issue__series'
+    else:
+        order_series = 'series'
+
+    objects = objects.filter(**{date_field + '__gte': '%d-%02d-%d' % (
+        year_start, month_start, day),
+                            date_field + '__lte': '%d-%02d-32' % (
+        year, month_end)}).order_by(date_field, order_series)
+
+    return objects
+
+
 def publisher_monthly_covers(request,
                              publisher_id,
                              year=None,
                              month=None,
-                             use_on_sale=True):
+                             use_on_sale=True,
+                             overview=False):
     """
     Display the covers for the monthly publications of a publisher.
     """
     publisher = get_gcd_object(Publisher, publisher_id)
+    yearly = False
 
-    if use_on_sale:
-        date_type = 'publisher_monthly_covers_on_sale'
+    if overview:
+        if use_on_sale:
+            date_type = 'publisher_monthly_issues_on_sale'
+        else:
+            date_type = 'publisher_monthly_issues_pub_date'
     else:
-        date_type = 'publisher_monthly_covers_pub_date'
+        if use_on_sale:
+            date_type = 'publisher_monthly_covers_on_sale'
+        else:
+            date_type = 'publisher_monthly_covers_pub_date'
 
     if year and 'month' not in request.GET:
         year = int(year)
@@ -968,21 +1194,6 @@ def publisher_monthly_covers(request,
             month = return_val[1]
 
     table_width = COVER_TABLE_WIDTH
-
-    covers = Cover.objects.filter(issue__series__publisher=publisher,
-                                  deleted=False).select_related('issue')
-    if use_on_sale:
-        covers = \
-          covers.filter(issue__on_sale_date__gte='%d-%02d-50' % (year,
-                                                                 month-1),
-                        issue__on_sale_date__lte='%d-%02d-32' % (year,
-                                                                 month))\
-                .order_by('issue__on_sale_date', 'issue__series')
-    else:
-        covers = \
-          covers.filter(issue__key_date__gte='%d-%02d-50' % (year, month-1),
-                        issue__key_date__lte='%d-%02d-32' % (year, month))\
-                .order_by('issue__key_date', 'issue__series')
 
     start_date = datetime(year, month, 1)
     date_before = start_date + timedelta(-1)
@@ -1001,26 +1212,212 @@ def publisher_monthly_covers(request,
                                               'publisher_id': publisher_id,
                                               'year': date_after.year,
                                               'month': date_after.month})
+    # TODO remove backward/forward links if overall less then 50
 
-    vars = {
-      'publisher': publisher,
-      'date': start_date,
-      'monthly': True,
-      'years': range(date.today().year,
-                     (publisher.year_began or 1900) - 1,
-                     -1),
-      'choose_url': choose_url,
-      'choose_url_after': choose_url_after,
-      'choose_url_before': choose_url_before,
-      'use_on_sale': use_on_sale,
-      'table_width': table_width,
-      'RANDOM_IMAGE': _publisher_image_content(publisher.id)
-    }
+    if overview:
+        heading = 'Comics '
+        issues = Issue.objects.filter(series__publisher=publisher,
+                                      variant_of=None, deleted=False)\
+                              .select_related('series')\
+                              .prefetch_related('cover_set')
+        continue_processing = False
+        # overall more than 50
+        if issues.count() > 50:
+            if use_on_sale:
+                heading += 'on-sale in '
+            else:
+                heading += 'with a publication date of '
+            issues = _filter_issues_year_month(issues, year, month,
+                                               use_on_sale, yearly=True)
+            continue_processing = True
+        # in this year more than 50
+        if issues.count() > 50:
+            issues = _filter_issues_year_month(issues, year, month,
+                                               use_on_sale)
+        # otherwise we have less 50 for this year, modify links, etc.
+        elif continue_processing:
+            yearly = True
+            if month == 1:
+                year_before = date_before.year
+            else:
+                year_before = date_before.year - 1
+            if month == 12:
+                year_after = date_after.year
+            else:
+                year_after = date_after.year + 1
+            choose_url_before = urlresolvers.reverse(
+              date_type, kwargs={'publisher_id': publisher_id,
+                                 'year': year_before,
+                                 'month': 12})
+            choose_url_after = urlresolvers.reverse(
+              date_type, kwargs={'publisher_id': publisher_id,
+                                 'year': year_after,
+                                 'month': 1})
+            heading += '%d ' % year
+            continue_processing = False
+        # there are none in the current month, redirect
+        if not issues.exists() and year == date.today().year and \
+           month == date.today().month:
+            issues = Issue.objects.filter(series__publisher=publisher,
+                                          variant_of=None, deleted=False)
+            if use_on_sale:
+                issues = issues.exclude(on_sale_date__contains='?')
+            if issues.exists():
+                if use_on_sale:
+                    latest_issues_date = issues.latest('on_sale_date')\
+                                               .on_sale_date
+                else:
+                    latest_issues_date = issues.latest('key_date').key_date
+                year = latest_issues_date[:4]
+                month = latest_issues_date[5:7]
+                if not month or month == '00':
+                    month = '01'
+                if month == '13':
+                    month = '12'
+                kwargs = {}
+                kwargs['publisher_id'] = publisher_id
+                kwargs['year'] = year
+                kwargs['month'] = month
+            else:
+                year = None
+            if year:
+                return HttpResponseRedirect(urlresolvers.reverse(
+                    date_type, kwargs=kwargs))
+            else:
+                issues = Issue.objects.none()
+        if continue_processing:
+            if month == 1:
+                heading += '%d or ' % year
+            heading += '%s ' % date(year, month, 1).strftime('%B %Y')
+        issues = issues.annotate(
+          longest_story_id=Subquery(Story.objects.filter(
+                                    issue_id=OuterRef('pk'),
+                                    type_id=19, deleted=False)
+                                    .values('pk')
+                                    .order_by('-page_count')[:1]))
+        heading += 'from %s' % publisher
 
-    return paginate_response(
-      request, covers, 'gcd/details/publisher_monthly_covers.html', vars,
-      per_page=COVERS_PER_GALLERY_PAGE,
-      callback_key='tags', callback=get_image_tags_per_page)
+        if 'sort' in request.GET:
+            sort = request.GET['sort']
+            choose_url_after += '?sort=%s' % request.GET['sort']
+            choose_url_before += '?sort=%s' % request.GET['sort']
+        else:
+            sort = ''
+
+        context = {
+          'item_name': 'issue',
+          'plural_suffix': 's',
+          'heading': heading,
+          'years': range(date.today().year,
+                         (publisher.year_began or 1900) - 1,
+                         -1),
+          'sort': sort,
+          'yearly': yearly,
+          'choose_url': choose_url,
+          'choose_url_after': choose_url_after,
+          'choose_url_before': choose_url_before,
+        }
+        template = 'gcd/search/issue_list_sortable.html'
+        table = CoverIssueStoryTable(
+          issues,
+          attrs={'class': 'sortable_listing'},
+          template_name='gcd/bits/sortable_table.html',
+          order_by=('issues'))
+        return generic_sortable_list(request, issues, table, template,
+                                     context, 50)
+    else:
+        heading = 'Covers for comics '
+        covers = Cover.objects.filter(issue__series__publisher=publisher,
+                                      deleted=False).select_related('issue')
+        continue_processing = False
+        if covers.count() > 50:
+            if use_on_sale:
+                heading += 'on-sale in '
+            else:
+                heading += 'with a publication date of '
+            covers = _filter_issues_year_month(covers, year, month,
+                                               use_on_sale, cover=True,
+                                               yearly=True)
+            continue_processing = True
+        if covers.count() > 50:
+            covers = _filter_issues_year_month(covers, year, month,
+                                               use_on_sale, cover=True)
+        elif continue_processing:
+            yearly = True
+            if month == 1:
+                year_before = date_before.year
+            else:
+                year_before = date_before.year - 1
+            if month == 12:
+                year_after = date_after.year
+            else:
+                year_after = date_after.year + 1
+            choose_url_before = urlresolvers.reverse(
+              date_type, kwargs={'publisher_id': publisher_id,
+                                 'year': year_before,
+                                 'month': 12})
+            choose_url_after = urlresolvers.reverse(
+              date_type, kwargs={'publisher_id': publisher_id,
+                                 'year': year_after,
+                                 'month': 1})
+            heading += '%d ' % year
+            continue_processing = False
+        if not covers.exists() and year == date.today().year and \
+           month == date.today().month:
+            covers = Cover.objects.filter(
+                issue__series__publisher=publisher, deleted=False)
+            if use_on_sale:
+                covers = covers.exclude(issue__on_sale_date__contains='?')
+            if covers.exists():
+                if use_on_sale:
+                    latest_issues_date = covers.latest('issue__on_sale_date')\
+                                               .issue.on_sale_date
+                else:
+                    latest_issues_date = covers.latest('issue__key_date')\
+                                               .issue.key_date
+                year = latest_issues_date[:4]
+                month = latest_issues_date[5:7]
+                if not month or month == '00':
+                    month = '01'
+                if month == '13':
+                    month = '12'
+                kwargs = {}
+                kwargs['publisher_id'] = publisher_id
+                kwargs['year'] = year
+                kwargs['month'] = month
+            else:
+                year = None
+            if year:
+                return HttpResponseRedirect(urlresolvers.reverse(
+                  date_type, kwargs=kwargs))
+            else:
+                covers = Cover.objects.none()
+        if continue_processing:
+            if month == 1:
+                heading += '%d or ' % year
+            heading += '%s ' % date(year, month, 1).strftime('%B %Y')
+        heading += 'from %s' % publisher
+        context = {
+          'publisher': publisher,
+          'date': start_date,
+          'monthly': True,
+          'years': range(date.today().year,
+                         (publisher.year_began or 1900) - 1,
+                         -1),
+          'yearly': yearly,
+          'choose_url': choose_url,
+          'choose_url_after': choose_url_after,
+          'choose_url_before': choose_url_before,
+          'use_on_sale': use_on_sale,
+          'table_width': table_width,
+          'heading': heading,
+          'RANDOM_IMAGE': _publisher_image_content(publisher.id)
+        }
+
+        return paginate_response(
+          request, covers, 'gcd/details/publisher_monthly_covers.html',
+          context, per_page=COVERS_PER_GALLERY_PAGE,
+          callback_key='tags', callback=get_image_tags_per_page)
 
 
 def indicia_publisher(request, indicia_publisher_id):
@@ -1344,6 +1741,61 @@ def show_series(request, series, preview=False):
         'is_none': IS_NONE,
         'RANDOM_IMAGE': _publisher_image_content(series.publisher_id)
       })
+
+
+def covers(request, series_id):
+    """
+    Display the cover gallery for a series.
+    """
+
+    series = get_gcd_object(Series, series_id)
+    # TODO: Figure out optimal table width and/or make it user controllable.
+    table_width = COVER_TABLE_WIDTH
+
+    covers = Cover.objects.filter(issue__series=series, deleted=False) \
+                          .select_related('issue')
+
+    vars = {
+      'series': series,
+      'error_subject': '%s covers' % series,
+      'table_width': table_width,
+      'RANDOM_IMAGE': _publisher_image_content(series.publisher_id)
+    }
+
+    return paginate_response(
+      request, covers, 'gcd/details/covers.html', vars,
+      per_page=COVERS_PER_GALLERY_PAGE, callback_key='tags',
+      callback=lambda page: get_image_tags_per_page(page, series))
+
+
+def series_overview(request, series_id):
+    """
+    Display the cover gallery for a series with core sequence info.
+    """
+
+    series = get_gcd_object(Series, series_id)
+
+    issues = series.active_issues().filter(variant_of=None)\
+                   .annotate(longest_story_id=Subquery(Story.objects.filter(
+                                              issue_id=OuterRef('pk'),
+                                              type_id=19, deleted=False)
+                                              .values('pk')
+                                              .order_by('-page_count')[:1]))
+
+    heading = 'Covers and Longest Comic Story for Series %s' % (series)
+
+    context = {
+        'item_name': 'issue',
+        'plural_suffix': 's',
+        'heading': heading,
+    }
+    template = 'gcd/search/issue_list_sortable.html'
+    table = CoverIssueStoryTable(
+      issues,
+      attrs={'class': 'sortable_listing'},
+      template_name='gcd/bits/sortable_table.html',
+      order_by=('issues'))
+    return generic_sortable_list(request, issues, table, template, context, 50)
 
 
 def series_details(request, series_id, by_date=False):
@@ -2000,20 +2452,44 @@ def do_on_sale_weekly(request, year=None, week=None):
     return issues_on_sale, vars
 
 
-def on_sale_weekly(request, year=None, week=None):
+def on_sale_weekly(request, year=None, week=None, variant=True):
     issues_on_sale, vars = do_on_sale_weekly(request, year, week)
     if vars is None:
         # MYCOMICS
         return issues_on_sale
 
-    table = IssuePublisherTable(
+    issues_on_sale = issues_on_sale.annotate(
+      longest_story_id=Subquery(Story.objects.filter(
+                                issue_id=OuterRef('pk'),
+                                type_id=19, deleted=False)
+                                .values('pk').order_by('-page_count')[:1]))
+
+    if not variant:
+        issues_on_sale = issues_on_sale.filter(variant_of=None)
+    filter = filter_issues(request, issues_on_sale)
+    issues_on_sale = filter.qs
+    table = CoverIssueStoryPublisherTable(
       issues_on_sale, attrs={'class': 'sortable_listing'},
       template_name='gcd/bits/sortable_table.html', order_by=('issues'))
-    return generic_sortable_list(request, issues_on_sale, table,
-                                 'gcd/status/issues_on_sale.html', vars)
+    vars['filter'] = filter
+    vars['variant'] = variant
+    if variant:
+        if year:
+            vars['path'] = urlresolvers.reverse("on_sale_weekly_no_variant",
+                                                kwargs={'year': year,
+                                                        'week': week})
+        else:
+            vars['path'] = urlresolvers.reverse("on_sale_this_week_no_variant")
+    else:
+        if year:
+            vars['path'] = urlresolvers.reverse("on_sale_weekly",
+                                                kwargs={'year': year,
+                                                        'week': week})
+        else:
+            vars['path'] = urlresolvers.reverse("on_sale_this_week")
 
-    return paginate_response(request, issues_on_sale,
-                             'gcd/status/issues_on_sale.html', vars)
+    return generic_sortable_list(request, issues_on_sale, table,
+                                 'gcd/status/issues_on_sale.html', vars, 50)
 
 
 def do_on_sale_monthly(request, year=None, month=None):
@@ -2073,16 +2549,45 @@ def do_on_sale_monthly(request, year=None, month=None):
     return issues_on_sale, vars
 
 
-def on_sale_monthly(request, year=None, month=None):
+def on_sale_monthly(request, year=None, month=None, variant=True):
     issues_on_sale, vars = do_on_sale_monthly(request, year, month)
     if vars is None:
         return issues_on_sale
-
-    table = IssuePublisherTable(
+    issues_on_sale = issues_on_sale.annotate(
+      longest_story_id=Subquery(Story.objects.filter(
+                                issue_id=OuterRef('pk'),
+                                type_id=19, deleted=False)
+                                .values('pk')
+                                .order_by('-page_count')[:1]))
+    if not variant:
+        issues_on_sale = issues_on_sale.filter(variant_of=None)
+    filter = filter_issues(request, issues_on_sale)
+    issues_on_sale = filter.qs
+    table = CoverIssueStoryPublisherTable(
+      issues_on_sale, attrs={'class': 'sortable_listing'},
+      template_name='gcd/bits/sortable_table.html', order_by=('issues'))
+    vars['filter'] = filter
+    vars['variant'] = variant
+    if variant:
+        if year:
+            vars['path'] = urlresolvers.reverse("on_sale_monthly_no_variant",
+                                                kwargs={'year': year,
+                                                        'month': month})
+        else:
+            vars['path'] = urlresolvers.reverse(
+              "on_sale_this_month_no_variant")
+    else:
+        if year:
+            vars['path'] = urlresolvers.reverse("on_sale_monthly",
+                                                kwargs={'year': year,
+                                                        'month': month})
+        else:
+            vars['path'] = urlresolvers.reverse("on_sale_this_month")
+    table = CoverIssueStoryPublisherTable(
       issues_on_sale, attrs={'class': 'sortable_listing'},
       template_name='gcd/bits/sortable_table.html', order_by=('issues'))
     return generic_sortable_list(request, issues_on_sale, table,
-                                 'gcd/status/issues_on_sale.html', vars)
+                                 'gcd/status/issues_on_sale.html', vars, 50)
 
 
 def int_stats_language(request):
@@ -2214,7 +2719,46 @@ def feature_issuelist_by_id(request, feature_id):
     return generic_sortable_list(request, issues, table, template, context)
 
 
+def feature_overview(request, feature_id):
+    feature = get_gcd_object(Feature, feature_id)
+
+    if feature.feature_type.id == 1:
+        issues = Issue.objects.filter(story__feature_object=feature,
+                                      story__type__id=19,
+                                      story__deleted=False).distinct()\
+                              .select_related('series__publisher')
+        issues = issues.annotate(
+          longest_story_id=Subquery(Story.objects.filter(
+                                    feature_object=feature,
+                                    issue_id=OuterRef('pk'),
+                                    type_id=19, deleted=False)
+                                    .values('pk')
+                                    .order_by('-page_count')[:1]))
+        result_disclaimer = OVERVIEW_DISCLAIMER
+    else:
+        issues = Issue.objects.none()
+        result_disclaimer = 'not supported for this feature type'
+
+    filter = filter_issues(request, issues)
+    issues = filter.qs
+
+    context = {
+        'result_disclaimer': result_disclaimer,
+        'item_name': 'issue',
+        'plural_suffix': 's',
+        'publisher': True,
+        'filter': filter,
+        'heading': 'Issue Overview for Feature %s' % (feature)
+    }
+    template = 'gcd/search/issue_list_sortable.html'
+    table = CoverIssueStoryTable(issues, attrs={'class': 'sortable_listing'},
+                                 template_name='gcd/bits/sortable_table.html',
+                                 order_by=('publication_date'))
+    return generic_sortable_list(request, issues, table, template, context, 50)
+
+
 def feature_creatorlist(request, feature_id):
+    # list of creators that worked on feature feature_id
     feature = get_gcd_object(Feature, feature_id)
 
     creators = CreatorNameDetail.objects.all()
@@ -2263,8 +2807,32 @@ def feature_creatorlist(request, feature_id):
     table = FeatureCreatorTable(creators, attrs={'class': 'sortable_listing'},
                                 feature=feature,
                                 template_name='gcd/bits/sortable_table.html',
-                                order_by=('creator__sort_name'))
+                                order_by=('name'))
     return generic_sortable_list(request, creators, table, template, context)
+
+
+def feature_covers(request, feature_id):
+    feature = get_gcd_object(Feature, feature_id)
+    issues = Issue.objects.filter(story__feature_object=feature,
+                                  story__type__id=6,
+                                  story__credits__deleted=False).distinct()\
+                          .select_related('series__publisher')
+
+    heading = 'Covers with Feature %s' % feature
+
+    context = {
+        'result_disclaimer': COVER_CHECKLIST_DISCLAIMER + MIGRATE_DISCLAIMER,
+        'item_name': 'cover',
+        'plural_suffix': 's',
+        'heading': heading
+    }
+    template = 'gcd/search/issue_list_sortable.html'
+    table = CoverIssuePublisherTable(
+      issues,
+      attrs={'class': 'sortable_listing'},
+      template_name='gcd/bits/sortable_table.html',
+      order_by=('publication_date'))
+    return generic_sortable_list(request, issues, table, template, context)
 
 
 def feature_logo(request, feature_logo_id):
@@ -2458,14 +3026,14 @@ def character_creators(request, character_id):
         'result_disclaimer': result_disclaimer,
         'item_name': 'creator',
         'plural_suffix': 's',
-        'heading': 'Creators Working on Character %s' % (character)
+        'heading': 'Creators Working on Character %s' % (character.name)
     }
     template = 'gcd/search/issue_list_sortable.html'
     table = CharacterCreatorTable(creators, attrs={'class':
                                                    'sortable_listing'},
                                   character=character,
                                   template_name='gcd/bits/sortable_table.html',
-                                  order_by=('creator__sort_name'))
+                                  order_by=('name'))
     return generic_sortable_list(request, creators, table, template, context)
 
 
@@ -2491,6 +3059,31 @@ def character_sequences(request, character_id, country=None):
                        template_name='gcd/bits/sortable_table.html',
                        order_by=('issue'))
     return generic_sortable_list(request, stories, table, template, context)
+
+
+def character_covers(request, character_id):
+    character = get_gcd_object(Character, character_id)
+    issues = Issue.objects.filter(
+      story__appearing_characters__character__character=character,
+      story__appearing_characters__deleted=False,
+      story__type__id=6,
+      story__deleted=False).distinct().select_related('series__publisher')
+
+    heading = 'Covers with Character %s' % character.name
+
+    context = {
+        'result_disclaimer': COVER_CHECKLIST_DISCLAIMER + MIGRATE_DISCLAIMER,
+        'item_name': 'cover',
+        'plural_suffix': 's',
+        'heading': heading
+    }
+    template = 'gcd/search/issue_list_sortable.html'
+    table = CoverIssuePublisherTable(
+      issues,
+      attrs={'class': 'sortable_listing'},
+      template_name='gcd/bits/sortable_table.html',
+      order_by=('publication_date'))
+    return generic_sortable_list(request, issues, table, template, context)
 
 
 def character_relation(request, character_relation_id):
@@ -2669,7 +3262,7 @@ def cover(request, issue_id, size):
     covers = Cover.objects.filter(issue__series=issue.series,
                                   issue__sort_code__lt=issue.sort_code,
                                   deleted=False)
-    cover_page = covers.count()/COVERS_PER_GALLERY_PAGE + 1
+    cover_page = int(covers.count()/COVERS_PER_GALLERY_PAGE) + 1
 
     return render(
       request, 'gcd/details/cover.html',
@@ -2683,39 +3276,6 @@ def cover(request, issue_id, size):
         'error_subject': '%s cover' % issue,
         'RANDOM_IMAGE': _publisher_image_content(issue.series.publisher_id)
       })
-
-
-def covers(request, series_id):
-    """
-    Display the cover gallery for a series.
-    """
-
-    series = get_gcd_object(Series, series_id)
-    # TODO: Figure out optimal table width and/or make it user controllable.
-    table_width = COVER_TABLE_WIDTH
-
-    # TODO: once we get permissions going 'can_mark' should be one
-    if request.user.is_authenticated and \
-       request.user.groups.filter(name='editor'):
-        can_mark = True
-    else:
-        can_mark = False
-
-    covers = Cover.objects.filter(issue__series=series, deleted=False) \
-                          .select_related('issue')
-
-    vars = {
-      'series': series,
-      'error_subject': '%s covers' % series,
-      'table_width': table_width,
-      'can_mark': can_mark,
-      'RANDOM_IMAGE': _publisher_image_content(series.publisher_id)
-    }
-
-    return paginate_response(
-      request, covers, 'gcd/details/covers.html', vars,
-      per_page=COVERS_PER_GALLERY_PAGE, callback_key='tags',
-      callback=lambda page: get_image_tags_per_page(page, series))
 
 
 def issue_images(request, issue_id):
@@ -2834,7 +3394,7 @@ def show_issue(request, issue, preview=False):
         covers = Cover.objects.filter(issue__series=issue.series,
                                       issue__sort_code__lt=issue.sort_code,
                                       deleted=False)
-        cover_page = covers.count()/COVERS_PER_GALLERY_PAGE + 1
+        cover_page = int(covers.count()/COVERS_PER_GALLERY_PAGE) + 1
 
     variant_image_tags = []
     for variant_cover in issue.variant_covers():
@@ -2860,15 +3420,14 @@ def show_issue(request, issue, preview=False):
     if not preview:
         res = issue.reservation_set.filter(status=3)
         for i in res:
-            oi_indexers.append(i.indexer)
+            oi_indexers.append(i.indexer.id)
 
-    res = IssueRevision.objects.filter(issue=issue)\
-                               .select_related('changeset__indexer__indexer')
-    res = res.filter(changeset__state=states.APPROVED)\
-             .exclude(changeset__indexer__username=settings.ANON_USER_NAME)
-    for i in res:
-        oi_indexers.append(i.changeset.indexer.indexer)
+    revs = issue.revisions.filter(changeset__state=states.APPROVED)\
+                .exclude(changeset__indexer__username=settings.ANON_USER_NAME)\
+                .select_related('changeset')
+    oi_indexers.extend(revs.values_list('changeset__indexer_id', flat=True))
     oi_indexers = list(set(oi_indexers))
+    oi_indexers = Indexer.objects.filter(user__id__in=oi_indexers)
 
     if series.is_singleton:
         country = series.country
@@ -2895,6 +3454,8 @@ def show_issue(request, issue, preview=False):
        'preview': preview,
        'not_shown_types': not_shown_types,
        'show_sources': show_sources,
+       'among_others': issue.created and issue.created.year <=
+                        settings.NEW_SITE_CREATION_DATE.year,
        'RANDOM_IMAGE': _publisher_image_content(issue.series.publisher_id)
        })
 

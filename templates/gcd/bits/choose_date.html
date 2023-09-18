@@ -3,12 +3,19 @@
 <div class="right">
   {% if daily %}
   <a href="{{ choose_url_before }}">&lt; {% trans "day before" %}</a> |
+  {% elif yearly %}
+  <a href="{{ choose_url_before }}">&lt; {% trans "year before" %}</a> |
   {% else %}
   <a href="{{ choose_url_before }}">&lt; {% trans "month before" %}</a> |
   {% endif %}
     <form method="GET"
           action="{{ choose_url }}"
           style="display:inline">
+      {% if sort%}
+      <select hidden name="sort" id="sort">
+        <option value="{{ sort }}">{{ sort }}</option>
+      </select>
+      {% endif %}
       <select name="year" id="year">
         {% for year in years  %}
         <option value="{{ year }}">{{ year }}</option>
@@ -36,6 +43,8 @@
   {% if choose_url_after %}
     {% if daily %}
    | <a href="{{ choose_url_after }}">{% trans "day after" %} &gt;</a>
+    {% elif yearly %}
+   | <a href="{{ choose_url_after }}">{% trans "year after" %} &gt;</a>
     {% else %}
    | <a href="{{ choose_url_after }}">{% trans "month after" %} &gt;</a>
     {% endif %}

@@ -19,7 +19,7 @@
         href="{% static "css/gcd/default/single_story.css" %}"/>
 {% endblock %}
 {% block css_raw %}
-<script src="https://unpkg.com/htmx.org@1.6.0" integrity="sha384-G4dtlRlMBrk5fEiRXDsLjriPo8Qk5ZeHVVxS8KhX6D7I9XXJlNqbdvRlp9/glk5D" crossorigin="anonymous"></script>
+<script type="text/javascript" src="{% static "js/htmx.min.js" %}"></script>
 {% endblock %}
 
 {% block view_body %}
@@ -82,19 +82,18 @@ This issue has variants:
                 </div>
               </div> <!-- issue.notes -->
 {% endif %} <!-- issue.notes -->
-{% if issue.series.is_comics_publication %}
-  {% with cover_story as story %}
-  {% with 1 as is_cover %}
-    {% include "gcd/details/single_story.html" %}
-  {% endwith %}
-  {% endwith %}
-{% else %}
+{% if not issue.series.is_comics_publication %}
               <div class="non_comics">
                 <h3>
                   <span class="left">The individual issues of this series are each less than 50% comics.  Only
                   comics sequences are indexed and cover scans are accepted only if the issue has 10% indexed comics content.<span>
                 </h3>
               </div>
+{% endif %}
+{% if cover_story %}
+  {% with story=cover_story is_cover=1 %}
+    {% include "gcd/details/single_story.html" %}
+  {% endwith %}
 {% endif %}
             </div>
           </div> <!-- coverContent -->
@@ -299,7 +298,7 @@ This issue has variants:
 {% if issue.series.index_credit_set.all.select_related or oi_indexers %}
       <div id="index_credits">
   {% if oi_indexers %}
-        <div id="indexers_header">{% trans "This issue was most recently modified by:" %}</div>
+        <div id="indexers_header">This issue was modified by{% if among_others %}, among others {% endif %}</div>
         <ul>
     {% for credit in oi_indexers %}
           <li> {{ credit }}

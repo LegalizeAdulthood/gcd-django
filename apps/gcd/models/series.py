@@ -334,10 +334,16 @@ class Series(GcdData):
 
     @cached_property
     def issues_to_migrate(self):
-        stories = Story.objects.exclude(Q(script='') | Q(script__startswith='?'),
-                                        Q(pencils='') | Q(pencils__startswith='?'),
-                                        Q(inks='') | Q(inks__startswith='?'),
-                                        Q(colors='') | Q(colors__startswith='?'))\
+        stories = Story.objects.exclude(Q(script='')
+                                        | Q(script__startswith='?'),
+                                        Q(pencils='')
+                                        | Q(pencils__startswith='?')
+                                        | Q(pencils__startswith='various'),
+                                        Q(inks='') | Q(inks__startswith='?')
+                                        | Q(inks__startswith='various'),
+                                        Q(colors='')
+                                        | Q(colors__startswith='?')
+                                        | Q(colors__startswith='various'),)\
                                         .filter(issue__series__id=self.id)\
                                         .exclude(type__in=AD_TYPES)\
                                         .filter(deleted=False)
@@ -485,9 +491,11 @@ class SeriesTable(tables.Table):
     name = NameColumn(verbose_name='Series')
     year = tables.Column(accessor='year_began', verbose_name='Year')
     issue_count = tables.Column(attrs={'td': {'style': "text-align: right"}},
-                                verbose_name='Issues')
+                                verbose_name='Issues',
+                                initial_sort_descending=True)
     covers = CoversColumn(accessor='scan_count',
-                          attrs={'td': {'style': "text-align: right"}})
+                          attrs={'td': {'style': "text-align: right"}},
+                          initial_sort_descending=True)
     published = PublishedColumn(accessor='year_began',
                                 attrs={'td': {'style': "text-align: right"}},
                                 orderable=False,
@@ -554,7 +562,8 @@ class SeriesPublisherTable(SeriesTable):
 
 class CreatorSeriesTable(SeriesTable):
     credits_count = tables.Column(accessor='issue_credits_count',
-                                  verbose_name='Issues')
+                                  verbose_name='Issues',
+                                  initial_sort_descending=True)
     covers = None
     published = None
     first_credit = tables.Column(verbose_name='First Credit')

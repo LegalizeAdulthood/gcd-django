@@ -7,10 +7,12 @@ from django.contrib.auth.decorators import permission_required
 from django.contrib.auth.mixins import LoginRequiredMixin
 from django.db.models import Q
 import django.urls as urlresolvers
-from django.http import HttpResponseRedirect
+from django.http import HttpResponseRedirect, JsonResponse
 from django.shortcuts import render
 from django.utils.datastructures import MultiValueDictKeyError
 from django.utils.html import format_html
+
+from django_filters import FilterSet, ModelChoiceFilter
 
 from dal import autocomplete
 
@@ -18,6 +20,7 @@ from apps.gcd.models import Publisher, Series, Issue, Story, StoryType, \
                             Creator, CreatorNameDetail, CreatorSignature, \
                             Feature, FeatureLogo, IndiciaPrinter, School, \
                             Character, CharacterNameDetail, Group, STORY_TYPES
+from apps.stddata.models import Country, Language
 from apps.gcd.views.search_haystack import GcdSearchQuerySet, \
                                            PaginatedFacetedSearchView
 from apps.gcd.views import paginate_response
@@ -62,21 +65,25 @@ def get_select_data(request, select_key):
 
 
 def get_select_forms(request, initial, data, publisher=False,
-                     series=False, issue=False, story=False):
+                     series=False, issue=False, story=False, cover=False):
     if issue:
         cached_issues = get_cached_issues(request)
     else:
         cached_issues = None
     if story:
         cached_stories = get_cached_stories(request)
-        cached_covers = get_cached_covers(request)
     else:
         cached_stories = None
+    if story or cover:
+        cached_covers = get_cached_covers(request)
+    else:
         cached_covers = None
+
     search_form = get_select_search_form(search_publisher=publisher,
                                          search_series=series,
                                          search_issue=issue,
-                                         search_story=story)
+                                         search_story=story,
+                                         search_cover=cover)
     if data:
         search_form = search_form(data)
     else:
@@ -271,13 +278,15 @@ def select_object(request, select_key):
         series = data.get('series', False)
         issue = data.get('issue', False)
         story = data.get('story', False)
+        cover = data.get('cover', False)
         search_form, cache_form = get_select_forms(request,
                                                    initial,
                                                    request_data,
                                                    publisher=publisher,
                                                    series=series,
                                                    issue=issue,
-                                                   story=story)
+                                                   story=story,
+                                                   cover=cover)
         haystack_form = FacetedSearchForm()
         return render(request, 'oi/edit/select_object.html',
                       {'heading': data['heading'],
@@ -289,6 +298,7 @@ def select_object(request, select_key):
                        'series': series,
                        'issue': issue,
                        'story': story,
+                       'cover': cover,
                        'target': data['target']
                        })
 
@@ -412,12 +422,49 @@ def cache_content(request, issue_id=None, story_id=None, cover_story_id=None):
 # auto-complete objects
 ##############################################################################
 
-def _filter_and_sort(qs, query, field='name'):
+def _filter_and_sort(qs, query, field='name', creator_detail=False,
+                     disambiguation=False, parent_disambiguation=None,
+                     interactive=True):
     if query:
-        qs = qs.filter(Q(**{'%s__icontains' % field: query}))
-        qs_match = qs.filter(Q(**{'%s' % field: query}))
-        if qs_match:
-            qs = qs_match.union(qs)
+        if disambiguation or parent_disambiguation:
+            if query.find(' [') > 1:
+                pos = query.find(' [')
+                disambiguation = query[pos+2:query.find(']') if
+                                       query.find(']') > 1 else None]
+                dis_query = query[:pos]
+                if parent_disambiguation:
+                    qs_contains = qs.filter(Q(**{
+                      '%s__icontains' % field: dis_query,
+                      '%s__disambiguation__istartswith' % parent_disambiguation:
+                      disambiguation}))
+                else:
+                    qs_contains = qs.filter(Q(**{'%s__icontains' % field:
+                                                 dis_query,
+                                                 'disambiguation__istartswith':
+                                                 disambiguation}))
+                qs_contains |= qs.filter(Q(**{'%s__icontains' % field: query}))
+            else:
+                qs_contains = qs.filter(Q(**{'%s__icontains' % field: query}))
+        else:
+            qs_contains = qs.filter(Q(**{'%s__icontains' % field: query}))
+        qs_return = None
+        if interactive and query.isdigit():
+            qs_match_id = qs.filter(Q(**{'id': query}))
+            if qs_match_id:
+                qs_return = qs_match_id.union(qs_contains)
+        if not qs_return:
+            if interactive:
+                qs_match = qs.filter(Q(**{'%s' % field: query}))
+            else:
+                qs_match = None
+            if qs_match:
+                qs_return = qs_match.union(qs_contains)
+            else:
+                if creator_detail:
+                    qs_return = qs_contains.select_related('creator')
+                else:
+                    qs_return = qs_contains
+        return qs_return
     return qs
 
 
@@ -437,7 +484,8 @@ class CreatorNameAutocomplete(LoginRequiredMixin,
         qs = CreatorNameDetail.objects.filter(deleted=False)\
                                       .exclude(type__id__in=[3, 4])
 
-        qs = _filter_and_sort(qs, self.q)
+        qs = _filter_and_sort(qs, self.q, creator_detail=True,
+                              parent_disambiguation='creator')
 
         return qs
 
@@ -446,9 +494,9 @@ class CreatorName4RelationAutocomplete(LoginRequiredMixin,
                                        autocomplete.Select2QuerySetView):
     def get_queryset(self):
         qs = CreatorNameDetail.objects.filter(deleted=False,
-                                              type__id__in=[5, 8, 12])
+                                              type__id__in=[5, 8, 12, 13])
 
-        creator_id = self.forwarded.get('to_creator', None)
+        creator_id = self.forwarded.get('from_creator', None)
 
         if creator_id:
             qs = qs.filter(creator__creator_names__id=creator_id)
@@ -482,7 +530,7 @@ class CreatorSignatureAutocomplete(LoginRequiredMixin,
 
 
 class SchoolAutocomplete(LoginRequiredMixin,
-                          autocomplete.Select2QuerySetView):
+                         autocomplete.Select2QuerySetView):
     def get_queryset(self):
         qs = School.objects.all()
 
@@ -493,7 +541,7 @@ class SchoolAutocomplete(LoginRequiredMixin,
 
 class FeatureAutocomplete(LoginRequiredMixin,
                           autocomplete.Select2QuerySetView):
-    def get_queryset(self):
+    def get_queryset(self, interactive=True):
         qs = Feature.objects.filter(deleted=False)
 
         language = self.forwarded.get('language_code', None)
@@ -515,7 +563,8 @@ class FeatureAutocomplete(LoginRequiredMixin,
             if type not in [STORY_TYPES['ad'], STORY_TYPES['comics-form ad']]:
                 qs = qs.exclude(feature_type__id=3)
 
-        qs = _filter_and_sort(qs, self.q)
+        qs = _filter_and_sort(qs, self.q, disambiguation=True,
+                              interactive=interactive)
 
         return qs
 
@@ -574,7 +623,7 @@ class CharacterAutocomplete(LoginRequiredMixin,
 
 
 class CharacterNameAutocomplete(LoginRequiredMixin,
-                            autocomplete.Select2QuerySetView):
+                                autocomplete.Select2QuerySetView):
     def get_queryset(self):
         qs = CharacterNameDetail.objects.filter(deleted=False)
 
@@ -587,7 +636,7 @@ class CharacterNameAutocomplete(LoginRequiredMixin,
         if group:
             qs = qs.filter(character__memberships__group=group)\
                    .distinct()
-        qs = _filter_and_sort(qs, self.q)
+        qs = _filter_and_sort(qs, self.q, parent_disambiguation='character')
 
         return qs
 
@@ -620,3 +669,175 @@ class IndiciaPrinterAutocomplete(LoginRequiredMixin,
         qs = _filter_and_sort(qs, self.q)
 
         return qs
+
+
+##############################################################################
+# filtering of objects in lists
+##############################################################################
+
+class SeriesFilter(FilterSet):
+    country = ModelChoiceFilter(queryset=Country.objects.all())
+    language = ModelChoiceFilter(queryset=Language.objects.all())
+    publisher = ModelChoiceFilter(queryset=Publisher.objects.all())
+
+    class Meta:
+        model = Series
+        fields = ['country', 'language', 'publisher']
+
+    def __init__(self, *args, **kwargs):
+        if 'countries' in kwargs:
+            countries = kwargs.pop('countries')
+        else:
+            countries = None
+        if 'languages' in kwargs:
+            languages = kwargs.pop('languages')
+        else:
+            languages = None
+        if 'publishers' in kwargs:
+            publishers = kwargs.pop('publishers')
+        else:
+            publishers = None
+        super(SeriesFilter, self).__init__(*args, **kwargs)
+        if countries:
+            qs = Country.objects.filter(id__in=countries)
+            self.filters['country'].queryset = qs
+        if languages:
+            qs = Language.objects.filter(id__in=languages)
+            self.filters['language'].queryset = qs
+        if publishers:
+            qs = Publisher.objects.filter(id__in=publishers)
+            self.filters['publisher'].queryset = qs
+
+
+class IssueFilter(FilterSet):
+    country = ModelChoiceFilter(field_name='series__country',
+                                label='Country',
+                                queryset=Country.objects.all())
+    language = ModelChoiceFilter(field_name='series__language',
+                                 label='Language',
+                                 queryset=Language.objects.all())
+    publisher = ModelChoiceFilter(field_name='series__publisher',
+                                  label='Publisher',
+                                  queryset=Publisher.objects.all())
+
+    class Meta:
+        model = Issue
+        fields = ['country', 'language', 'publisher']
+
+    def __init__(self, *args, **kwargs):
+        if 'countries' in kwargs:
+            countries = kwargs.pop('countries')
+        else:
+            countries = None
+        if 'languages' in kwargs:
+            languages = kwargs.pop('languages')
+        else:
+            languages = None
+        if 'publishers' in kwargs:
+            publishers = kwargs.pop('publishers')
+        else:
+            publishers = None
+        super(IssueFilter, self).__init__(*args, **kwargs)
+        if countries:
+            qs = Country.objects.filter(id__in=countries)
+            self.filters['country'].queryset = qs
+        if languages:
+            qs = Language.objects.filter(id__in=languages)
+            self.filters['language'].queryset = qs
+        if publishers:
+            qs = Publisher.objects.filter(id__in=publishers)
+            self.filters['publisher'].queryset = qs
+
+
+class SequenceFilter(FilterSet):
+    country = ModelChoiceFilter(field_name='issue__series__country',
+                                label='Country',
+                                queryset=Country.objects.all())
+    language = ModelChoiceFilter(field_name='issue__series__language',
+                                 label='Language',
+                                 queryset=Language.objects.all())
+    publisher = ModelChoiceFilter(field_name='issue__series__publisher',
+                                  label='Publisher',
+                                  queryset=Publisher.objects.all())
+
+    class Meta:
+        model = Issue
+        fields = ['country', 'language', 'publisher']
+
+    def __init__(self, *args, **kwargs):
+        if 'countries' in kwargs:
+            countries = kwargs.pop('countries')
+        else:
+            countries = None
+        if 'languages' in kwargs:
+            languages = kwargs.pop('languages')
+        else:
+            languages = None
+        if 'publishers' in kwargs:
+            publishers = kwargs.pop('publishers')
+        else:
+            publishers = None
+        super(SequenceFilter, self).__init__(*args, **kwargs)
+        if countries:
+            qs = Country.objects.filter(id__in=countries)
+            self.filters['country'].queryset = qs
+        if languages:
+            qs = Language.objects.filter(id__in=languages)
+            self.filters['language'].queryset = qs
+        if publishers:
+            qs = Publisher.objects.filter(id__in=publishers)
+            self.filters['publisher'].queryset = qs
+
+
+def filter_issues(request, issues):
+    data = set(issues.values_list('series__country',
+                                  'series__language',
+                                  'series__publisher'))
+    countries = []
+    languages = []
+    publishers = []
+    for i in data:
+        countries.append(i[0])
+        languages.append(i[1])
+        publishers.append(i[2])
+    filter = IssueFilter(request.GET,
+                         queryset=issues,
+                         countries=countries,
+                         languages=languages,
+                         publishers=publishers)
+    return filter
+
+
+def filter_sequences(request, sequences):
+    data = set(sequences.values_list('issue__series__country',
+                                     'issue__series__language',
+                                     'issue__series__publisher'))
+    countries = []
+    languages = []
+    publishers = []
+    for i in data:
+        countries.append(i[0])
+        languages.append(i[1])
+        publishers.append(i[2])
+    filter = SequenceFilter(request.GET,
+                            queryset=sequences,
+                            countries=countries,
+                            languages=languages,
+                            publishers=publishers)
+    return filter
+
+##############################################################################
+# selecting of objects
+##############################################################################
+
+
+def creator_for_detail(request):
+    name_detail_id = request.GET['name_detail_id']
+    qs = Creator.objects.filter(creator_names__id=name_detail_id)
+    if qs:
+        creator_name = qs.get().creator_names.get(is_official_name=True)
+        data = [{'creator_id': creator_name.id,
+                 'creator_name': str(creator_name)}]
+    else:
+        data = [{'creator_id': -1}]
+    return JsonResponse(data, safe=False)

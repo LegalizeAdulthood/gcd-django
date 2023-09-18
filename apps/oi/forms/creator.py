@@ -100,6 +100,10 @@ class CustomInlineFormSet(forms.BaseInlineFormSet):
                                                 .filter(deleted=False).count():
                 form.cleaned_data['DELETE'] = False
                 return False
+        if form.instance.creator_name_detail:
+            if form.instance.creator_name_detail.is_official_name:
+                form.cleaned_data['DELETE'] = False
+                return False
         return super(CustomInlineFormSet, self)._should_delete_form(form)
 
     def clean(self):
@@ -663,7 +667,7 @@ class CreatorRelationRevisionForm(forms.ModelForm):
     )
 
     creator_name = forms.ModelMultipleChoiceField(
-      queryset=CreatorNameDetail.objects.filter(type__id__in=[5, 8, 12],
+      queryset=CreatorNameDetail.objects.filter(type__id__in=[5, 8, 12, 13],
                                                 deleted=False),
       widget=autocomplete.ModelSelect2Multiple(
         url='creator_name_4_relation_autocomplete',

@@ -523,6 +523,9 @@ class Story(GcdData):
     def show_characters(self):
         return self._show_characters(self)
 
+    def show_characters_as_text(self):
+        return show_characters(self, url=False)
+
     def _show_feature(cls, story):
         return show_feature(story)
 
@@ -632,11 +635,11 @@ class StoryTable(tables.Table):
                         template_name='gcd/bits/sortable_sequence_entry.html')
     issue = IssueColumn(accessor='issue__id', verbose_name='Issue',
                         template_name='gcd/bits/sortable_issue_entry.html')
-    publisher = tables.Column(accessor='issue.series.publisher',
+    publisher = tables.Column(accessor='issue__series__publisher',
                               verbose_name='Publisher')
-    publication_date = tables.Column(accessor='issue.publication_date',
+    publication_date = tables.Column(accessor='issue__publication_date',
                                      verbose_name='Publication Date')
-    on_sale_date = tables.Column(accessor='issue.on_sale_date',
+    on_sale_date = tables.Column(accessor='issue__on_sale_date',
                                  verbose_name='On-sale Date')
 
     class Meta:

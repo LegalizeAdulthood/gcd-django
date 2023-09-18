@@ -30,6 +30,21 @@ INDEXED = {
     'ten_percent': 3,
 }
 
+# 1: variant with cover artwork and cover image identical to base
+# 2: variant with different scan, but cover artwork identical to base
+# 3: variant with cover artwork different to base
+VARIANT_COVER_STATUS = {
+    1: 'No Difference',
+    2: 'Only Scan Difference',
+    3: 'Artwork Difference'
+}
+
+
+class VCS_Codes(models.IntegerChoices):
+    NO_DIFFERENCE = 1
+    ONLY_SCAN_DIFFERENCE = 2
+    ARTWORK_DIFFERENCE = 3
+
 
 def issue_descriptor(issue):
     if issue.number == '[nn]' and issue.series.is_singleton:
@@ -121,6 +136,8 @@ class Issue(GcdData):
     variant_of = models.ForeignKey('self', on_delete=models.CASCADE, null=True,
                                    related_name='variant_set')
     variant_name = models.CharField(max_length=255)
+    variant_cover_status = models.IntegerField(choices=VCS_Codes.choices,
+                                               default=3, db_index=True)
     barcode = models.CharField(max_length=38, db_index=True)
     no_barcode = models.BooleanField(default=False)
     rating = models.CharField(max_length=255, default='', db_index=True)
@@ -235,6 +252,19 @@ class Issue(GcdData):
     def active_code_numbers(self):
         return self.code_number.all()
 
+    def get_cover_sequence(self):
+        if not self.variant_of or self.variant_cover_status == 3:
+            cover = self.active_stories().filter(type=STORY_TYPES['cover'])\
+                        .prefetch_related('credits__creator__creator')
+        else:
+            cover = self.variant_of.active_stories()\
+                        .filter(type=STORY_TYPES['cover'])\
+                        .prefetch_related('credits__creator__creator')
+        if cover:
+            return cover[0]
+        else:
+            return None
+
     def shown_stories(self):
         """ returns cover sequence and story sequences """
         if self.variant_of:
@@ -249,19 +279,18 @@ class Issue(GcdData):
                                      'feature_logo__feature',
                                      'credits__creator__creator',
                                      'credits__creator__type'))
-        if self.series.is_comics_publication:
+        cover_story = None
+        if self.series.is_comics_publication or (
+          self.series.has_about_comics is True and
+          self.is_indexed == INDEXED['full']):
             if (len(stories) > 0) and stories[0].type_id == 6:
                 cover_story = stories.pop(0)
-                if self.variant_of:
-                    # can have only one sequence, the variant cover
+            if self.variant_of:
+                if self.variant_cover_status == 3:
                     if self.active_stories().count():
                         cover_story = self.active_stories()[0]
-            elif self.variant_of and len(list(self.active_stories())):
-                cover_story = self.active_stories()[0]
-            else:
-                cover_story = None
-        else:
-            cover_story = None
+                    else:
+                        cover_story = None
         return cover_story, stories
 
     def _active_covers(self):
@@ -270,16 +299,23 @@ class Issue(GcdData):
         else:
             return self.cover_set.none()
 
-    def active_covers(self):
+    def active_covers(self, stats=False):
+        # check for variant with no image difference
+        if self.variant_of and self.variant_cover_status == 1 and not stats:
+            return self.variant_of.active_covers()
         return self._active_covers()
 
     def variant_covers(self):
         """ returns the images from the variant issues """
         from .cover import Cover
         if self.variant_of:
-            variant_issues = list(self.variant_of.active_variants()
-                                      .exclude(id=self.id)
-                                      .values_list('id', flat=True))
+            # check for variant with no image difference
+            if self.variant_cover_status == 1:
+                return self.variant_of.variant_covers()
+            else:
+                variant_issues = list(self.variant_of.active_variants()
+                                          .exclude(id=self.id)
+                                          .values_list('id', flat=True))
         else:
             variant_issues = list(self.active_variants()
                                       .values_list('id', flat=True))
@@ -347,7 +383,8 @@ class Issue(GcdData):
         next_issue = None
 
         earlier_issues = self.series.active_base_issues()\
-                             .filter(sort_code__lt=self.sort_code)
+                             .filter(sort_code__lt=self.sort_code)\
+                             .exclude(id=self.variant_of_id)
         earlier_issues = earlier_issues.order_by('-sort_code')
         if earlier_issues:
             prev_issue = earlier_issues[0]
@@ -473,7 +510,7 @@ class Issue(GcdData):
 
         counts = {
             'stories': self.active_stories().count(),
-            'covers': self.active_covers().count(),
+            'covers': self.active_covers(stats=True).count(),
         }
 
         if not self.variant_of_id:
@@ -637,7 +674,7 @@ class IssueTable(tables.Table):
 
 
 class IssuePublisherTable(IssueTable):
-    publisher = tables.Column(accessor='series.publisher',
+    publisher = tables.Column(accessor='series__publisher',
                               verbose_name='Publisher')
 
     class Meta:

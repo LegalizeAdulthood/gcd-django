@@ -20,6 +20,7 @@ NAME_TYPES = {
     'house': 5,
     'studio': 8,
     'ghost': 12,
+    'joint': 13,
 }
 
 
@@ -112,7 +113,7 @@ class CreatorNameDetail(GcdData):
     class Meta:
         db_table = 'gcd_creator_name_detail'
         app_label = 'gcd'
-        ordering = ['sort_name', '-creator__birth_date__year', 'type__id']
+        ordering = ['sort_name', '-creator__birth_date__year', 'type_id']
         verbose_name_plural = 'CreatorName Details'
 
     name = models.CharField(max_length=255, db_index=True)
@@ -137,13 +138,22 @@ class CreatorNameDetail(GcdData):
             url = False
         if self.is_official_name:
             name = self.name
+            if compare and self.creator.disambiguation:
+                name += ' [%s]' % self.creator.disambiguation
             if self.type and self.type_id == NAME_TYPES['house']:
                 if credit.credit_name:
                     credit.credit_name += ', house name'
                 else:
                     credit.credit_name = 'house name'
+            elif self.type and self.type_id == NAME_TYPES['joint']:
+                if credit.credit_name:
+                    credit.credit_name += ', joint name'
+                else:
+                    credit.credit_name = 'joint name'
         else:
             name = self.creator.gcd_official_name
+            if compare and self.creator.disambiguation:
+                name += ' [%s]' % self.creator.disambiguation
             if (credit.is_credited and not credit.credited_as) \
                or (self.type and self.type_id == NAME_TYPES['studio']) \
                or (self.in_script != self.creator.creator_names.get(
@@ -160,12 +170,19 @@ class CreatorNameDetail(GcdData):
                                   .active_names().get(is_official_name=True)
                 else:
                     as_name = self
+            elif self.type and self.type_id == NAME_TYPES['joint']:
+                if self.creator_relation.exists():
+                    as_name = self.creator_relation.get().to_creator\
+                                  .active_names().get(is_official_name=True)
+                else:
+                    as_name = self
             elif compare or search:
                 # for compare and search use uncredited non-official-name
                 as_name = self
             if self.type and self.type_id == NAME_TYPES['studio'] \
                and self.creator_relation.count():
-                co_name = self.creator_relation.get().to_creator
+                co_name = self.creator_relation.filter(deleted=False).get()\
+                              .to_creator
 
         if credit.uncertain:
             name += ' ?'
@@ -215,6 +232,9 @@ class CreatorNameDetail(GcdData):
             elif self.type_id == NAME_TYPES['house']:
                 attribute = 'under house name '
                 display_as_name = as_name.name
+            elif self.type_id == NAME_TYPES['joint']:
+                attribute = 'under joint name '
+                display_as_name = as_name.name
             elif credit.is_credited and not credit.credited_as:
                 attribute = 'credited as '
                 display_as_name = as_name.name
@@ -225,7 +245,7 @@ class CreatorNameDetail(GcdData):
             else:
                 attribute = 'as '
                 display_as_name = as_name.name
-                if compare and self.type_id != NAME_TYPES['studio']:
+                if compare and self.type_id not in [NAME_TYPES['studio'], ]:
                     compare_info = '<br> Note: Non-official name '\
                                     'selected without credited-flag.'
             if url:
@@ -375,7 +395,7 @@ class Creator(GcdData):
     def _portrait(self):
         content_type = ContentType.objects.get_for_model(self)
         img = Image.objects.filter(object_id=self.id, deleted=False,
-                                   content_type=content_type, type__id=4)
+                                   content_type=content_type, type_id=4)
         if img:
             return img.get()
         else:
@@ -386,7 +406,7 @@ class Creator(GcdData):
     def _samplescan(self):
         content_type = ContentType.objects.get_for_model(self)
         img = Image.objects.filter(object_id=self.id, deleted=False,
-                                   content_type=content_type, type__id=5)
+                                   content_type=content_type, type_id=5)
         if img:
             return img.get()
         else:
@@ -472,7 +492,7 @@ class Creator(GcdData):
     def active_awards_for_issues(self):
         from .issue import Issue
         issues = Issue.objects.filter(story__credits__creator__creator=self,
-                                      story__type__id__in=[10, 19, 20, 21, 27],
+                                      story__type_id__in=[10, 19, 20, 21, 27],
                                       awards__isnull=False).distinct()
         content_type = ContentType.objects.get(model='Issue')
         awards = ReceivedAward.objects.filter(content_type=content_type,
@@ -523,12 +543,17 @@ class Creator(GcdData):
                 'show_creator',
                 kwargs={'creator_id': self.id})
 
-    def __str__(self):
-        if self.birth_date.year:
-            year = ' (b. %s)' % self.birth_date.year
+    def search_result_name(self):
+        if self.disambiguation:
+            extra = ' [%s]' % self.disambiguation
         else:
-            year = ''
-        return '%s%s' % (str(self.gcd_official_name), year)
+            extra = ''
+        return self.__str__(extra)
+
+    def __str__(self, extra=''):
+        if self.birth_date.year:
+            extra += ' (b. %s)' % self.birth_date.year
+        return '%s%s' % (str(self.gcd_official_name), extra)
 
 
 class CreatorSignature(GcdData):
@@ -553,7 +578,7 @@ class CreatorSignature(GcdData):
     def _signature(self):
         content_type = ContentType.objects.get_for_model(self)
         img = Image.objects.filter(object_id=self.id, deleted=False,
-                                   content_type=content_type, type__id=7)
+                                   content_type=content_type, type_id=7)
         if img:
             return img.get()
         else:
@@ -980,7 +1005,8 @@ class CreatorTable(tables.Table):
     detail_name = tables.Column(accessor='name', verbose_name='Used Name')
     first_credit = tables.Column(verbose_name='First Credit')
     credits_count = tables.Column(accessor='credits_count',
-                                  verbose_name='# Issues')
+                                  verbose_name='# Issues',
+                                  initial_sort_descending=True)
     role = tables.Column(accessor='script', orderable=False)
 
     def order_name(self, query_set, is_descending):
@@ -1034,6 +1060,49 @@ class CharacterCreatorTable(CreatorTable):
         self.character = kwargs.pop('character')
         self.resolve_name = 'character'
         super(CreatorTable, self).__init__(*args, **kwargs)
+
+
+class CreatorCreatorTable(CreatorTable):
+    name = tables.Column(accessor='gcd_official_name',
+                         verbose_name='Creator Name')
+    credits_count = tables.Column(accessor='issue_credits_count',
+                                  verbose_name='# Issues',
+                                  initial_sort_descending=True)
+    detail_name = None
+
+    def __init__(self, *args, **kwargs):
+        self.creator = kwargs.pop('creator')
+        self.resolve_name = 'creator'
+        super(CreatorTable, self).__init__(*args, **kwargs)
+
+    def order_name(self, query_set, is_descending):
+        direction = '-' if is_descending else ''
+        query_set = query_set.order_by(direction + 'sort_name')
+        return (query_set, True)
+
+    class Meta:
+        model = Creator
+        fields = ('name', 'credits_count', 'first_credit', 'role')
+
+    def render_credits_count(self, record):
+        # return record.issue_credits_count
+        url = urlresolvers.reverse(
+                'creator_cocreator_issues',
+                kwargs={'co_creator_id': record.id,
+                        '%s_id' % self.resolve_name:
+                        getattr(self, self.resolve_name).id})
+        return mark_safe('<a href="%s">%s</a>' % (url,
+                                                  record.issue_credits_count))
+
+    def value_credits_count(self, record):
+        return record.issue_credits_count
+
+    def render_name(self, record):
+        from apps.gcd.templatetags.display import absolute_url
+        return absolute_url(record)
+
+    def value_name(self, record):
+        return str(record)
 
 
 class GroupCreatorTable(CreatorTable):
